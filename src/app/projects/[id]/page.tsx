@@ -198,7 +198,7 @@ export default function ProjectWorkbench() {
   // ─── Engine Config from localStorage ───
   const getEngineConfig = () => {
     try {
-      const raw = localStorage.getItem('appConfig')
+      const raw = localStorage.getItem('drama-settings')
       if (!raw) return null
       const config: AppConfig = JSON.parse(raw)
       const engineKey = config.activeEngine || 'qwen'

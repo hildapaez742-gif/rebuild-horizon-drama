@@ -43,7 +43,7 @@ export default function ProjectsPage() {
 
   const getUserId = useCallback((): string => {
     try {
-      const raw = localStorage.getItem('drama-config')
+      const raw = localStorage.getItem('drama-settings')
       if (raw) {
         const cfg = JSON.parse(raw)
         if (cfg.userName) return cfg.userName
