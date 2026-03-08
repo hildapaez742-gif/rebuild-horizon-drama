@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import OpenAI from 'openai'
 import { buildSystemPrompt } from '@/lib/skill-loader'
 import { fetchAllHotLists, formatHotListForAI, serperSearch, formatSearchForAI } from '@/lib/search'
 import type { SkillPhase, ChatMessage } from '@/lib/types'
@@ -9,51 +8,106 @@ const DEFAULT_BASE_URLS: Record<string, string> = {
   qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
 }
 
-function sseError(message: string): Response {
-  console.error('[chat API error]', message)
+// ═══════════════════════════════════════════
+// SSE 工具函数
+// ═══════════════════════════════════════════
+
+const SSE_HEADERS = {
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-cache',
+  Connection: 'keep-alive',
+}
+
+/** 将多个 SSE 事件字符串包装为 Response */
+function sseWrap(events: string[]): Response {
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
     start(controller) {
-      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: message })}\n\n`))
-      controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      for (const evt of events) controller.enqueue(encoder.encode(evt))
       controller.close()
     },
   })
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    },
-  })
+  return new Response(stream, { headers: SSE_HEADERS })
 }
 
+/** 返回一条 SSE 错误事件 */
+function sseError(message: string): Response {
+  console.error('[chat API error]', message)
+  return sseWrap([
+    `data: ${JSON.stringify({ error: message })}\n\n`,
+    'data: [DONE]\n\n',
+  ])
+}
+
+/** 将完整文本包装为 SSE 事件流返回给前端 */
+function sseFullText(text: string): Response {
+  // 分段发送（每段约 200 字符），让前端看到渐进式渲染而不是一次性大段文字
+  const events: string[] = []
+  for (let i = 0; i < text.length; i += 200) {
+    events.push(`data: ${JSON.stringify({ text: text.slice(i, i + 200) })}\n\n`)
+  }
+  events.push('data: [DONE]\n\n')
+  return sseWrap(events)
+}
+
+// ═══════════════════════════════════════════
+// 文本提取（兼容多种 API 格式）
+// ═══════════════════════════════════════════
+
 /**
- * 从 stream chunk 中提取文本，兼容多种 API 返回格式：
- * - OpenAI 标准: choices[0].delta.content
- * - 部分代理:    choices[0].message.content
- * - Anthropic 原生透传: delta.text / content_block.text
+ * 从流式 chunk 中提取文本
+ * - OpenAI 标准:     choices[0].delta.content
+ * - 部分代理:         choices[0].message.content
+ * - Anthropic 原生:  delta.text / content_block.text
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractTextFromChunk(chunk: any): string {
-  // Path 1: OpenAI standard streaming format
   const deltaContent = chunk?.choices?.[0]?.delta?.content
   if (typeof deltaContent === 'string' && deltaContent) return deltaContent
 
-  // Path 2: Some proxies return message instead of delta
   const msgContent = chunk?.choices?.[0]?.message?.content
   if (typeof msgContent === 'string' && msgContent) return msgContent
 
-  // Path 3: Anthropic native format (content_block_delta)
   const anthropicDelta = chunk?.delta?.text
   if (typeof anthropicDelta === 'string' && anthropicDelta) return anthropicDelta
 
-  // Path 4: Anthropic content_block
   const blockText = chunk?.content_block?.text
   if (typeof blockText === 'string' && blockText) return blockText
 
   return ''
 }
+
+/**
+ * 从非流式完整 JSON 响应中提取文本
+ * - OpenAI:     { choices: [{ message: { content: "..." } }] }
+ * - Anthropic:  { content: [{ type: "text", text: "..." }] }
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractTextFromNonStream(data: any): string {
+  // OpenAI 标准
+  const choiceContent = data?.choices?.[0]?.message?.content
+  if (typeof choiceContent === 'string' && choiceContent) return choiceContent
+
+  // Anthropic Messages API
+  if (Array.isArray(data?.content)) {
+    const texts = data.content
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .filter((b: any) => b?.type === 'text' && typeof b?.text === 'string')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((b: any) => b.text)
+    if (texts.length > 0) return texts.join('')
+  }
+
+  // 兜底：尝试 data.text / data.response
+  if (typeof data?.text === 'string' && data.text) return data.text
+  if (typeof data?.response === 'string' && data.response) return data.response
+
+  return ''
+}
+
+// ═══════════════════════════════════════════
+// 主处理函数
+// ═══════════════════════════════════════════
 
 export async function POST(req: NextRequest) {
   // 1. 解析请求
@@ -96,71 +150,116 @@ export async function POST(req: NextRequest) {
   }
 
   const systemPrompt = buildSystemPrompt(phase, extraContext || undefined)
-
-  // 3. 创建 OpenAI 客户端
-  //    注意：不注入 anthropic-version header —— 该头部仅适用于 Anthropic
-  //    原生 Messages API，注入到 OAI 兼容 /chat/completions 会干扰响应格式
   const baseURL = engineConfig.config.baseUrl || DEFAULT_BASE_URLS[engineConfig.activeEngine]
   console.log('[chat] using baseURL:', baseURL)
 
-  const client = new OpenAI({
-    apiKey: engineConfig.config.apiKey,
-    baseURL,
-  })
-
-  const openaiMessages: OpenAI.ChatCompletionMessageParam[] = [
+  // 3. 构造 OpenAI 格式的消息体
+  const openaiMessages = [
     { role: 'system', content: systemPrompt },
-    ...messages.map((m) => ({
-      role: m.role as 'user' | 'assistant',
-      content: m.content,
-    })),
+    ...messages.map((m) => ({ role: m.role, content: m.content })),
   ]
 
-  // 4. 创建流式连接
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let stream: any
+  // 4. 使用原生 fetch 发起请求（获取 Content-Type 控制权）
+  let response: Response
   try {
-    stream = await client.chat.completions.create({
-      model: engineConfig.config.model,
-      messages: openaiMessages,
-      stream: true,
-      max_tokens: 4096,
-      temperature: 0.7,
+    response = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${engineConfig.config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: engineConfig.config.model,
+        messages: openaiMessages,
+        stream: true,
+        max_tokens: 4096,
+        temperature: 0.7,
+      }),
     })
-    console.log('[chat] stream created successfully')
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '')
+      return sseError(`AI 连接失败: HTTP ${response.status} ${errBody.slice(0, 200)}`)
+    }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    return sseError(`AI 连接失败: ${msg}`)
+    return sseError(`AI 连接失败: ${e instanceof Error ? e.message : String(e)}`)
   }
 
-  // 5. 流式输出
+  const contentType = response.headers.get('content-type') || ''
+  console.log('[chat] response content-type:', contentType)
+
+  // ─── 5a. 非流式 JSON 响应（中转服务器强制覆盖了 stream 参数）───
+  if (contentType.includes('application/json')) {
+    console.log('[chat] non-stream JSON response detected, falling back')
+    try {
+      const data = await response.json()
+
+      // 检查是否是 API 错误
+      if (data?.error) {
+        const errMsg = typeof data.error === 'string'
+          ? data.error
+          : data.error?.message || JSON.stringify(data.error).slice(0, 200)
+        return sseError(`AI 错误: ${errMsg}`)
+      }
+
+      const text = extractTextFromNonStream(data)
+      if (!text) {
+        return sseError(`AI 返回了空内容（非流式 JSON，顶层 keys: ${Object.keys(data).join(', ')}）`)
+      }
+
+      console.log('[chat] non-stream text extracted, length:', text.length)
+      return sseFullText(text)
+    } catch (e) {
+      return sseError(`非流式响应解析失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  // ─── 5b. 标准流式 SSE 响应 ───
+  console.log('[chat] processing as SSE stream')
   const encoder = new TextEncoder()
   const readable = new ReadableStream({
     async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
       let chunkCount = 0
-      let totalChunksSeen = 0
       let firstChunkRaw = ''
+
       try {
-        for await (const chunk of stream) {
-          totalChunksSeen++
-          // 记录前两个 chunk 结构用于诊断
-          if (totalChunksSeen <= 2) {
-            const raw = JSON.stringify(chunk).slice(0, 400)
-            console.log(`[chat] chunk #${totalChunksSeen}:`, raw)
-            if (totalChunksSeen === 1) firstChunkRaw = raw
-          }
-          const text = extractTextFromChunk(chunk)
-          if (text) {
-            chunkCount++
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`))
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop()!
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || !trimmed.startsWith('data: ')) continue
+            const payload = trimmed.slice(6)
+            if (payload === '[DONE]') continue
+
+            try {
+              const chunk = JSON.parse(payload)
+              if (chunkCount === 0) {
+                firstChunkRaw = JSON.stringify(chunk).slice(0, 200)
+                console.log('[chat] first SSE chunk:', firstChunkRaw)
+              }
+              const text = extractTextFromChunk(chunk)
+              if (text) {
+                chunkCount++
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`))
+              }
+            } catch { /* ignore SSE parse errors */ }
           }
         }
-        console.log('[chat] stream done, totalChunks:', totalChunksSeen, 'textChunks:', chunkCount)
+
+        console.log('[chat] stream done, textChunks:', chunkCount)
         if (chunkCount === 0) {
-          // 将首个 chunk 结构包含在错误消息中，方便用户诊断 API 实际返回格式
-          const hint = totalChunksSeen === 0
-            ? '（API 返回了 0 个 chunk，可能端点不正确）'
-            : `（收到 ${totalChunksSeen} 个 chunk 但均无文本，首个 chunk: ${firstChunkRaw.slice(0, 150)}）`
+          const hint = firstChunkRaw
+            ? `（首个 chunk: ${firstChunkRaw}）`
+            : '（未收到有效 SSE 事件）'
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: `AI 返回了空内容 ${hint}` })}\n\n`))
         }
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
@@ -175,11 +274,5 @@ export async function POST(req: NextRequest) {
     },
   })
 
-  return new Response(readable, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    },
-  })
+  return new Response(readable, { headers: SSE_HEADERS })
 }
