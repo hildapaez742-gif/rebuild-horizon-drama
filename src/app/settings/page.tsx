@@ -134,11 +134,11 @@ export default function SettingsPage() {
         body: JSON.stringify({ engine: config.activeEngine, config: engineConfig }),
       });
 
-      if (res.ok) {
-        showToast('连接成功', 'success');
+      const data = await res.json().catch(() => ({ success: false, message: '响应解析失败' }));
+      if (res.ok && data.success) {
+        showToast(data.message || '连接成功', 'success');
       } else {
-        const data = await res.json().catch(() => ({}));
-        showToast(data.error || '连接失败', 'error');
+        showToast(data.message || '连接失败，请检查 API Key 和 Base URL', 'error');
       }
     } catch {
       showToast('网络错误，无法测试连接', 'error');

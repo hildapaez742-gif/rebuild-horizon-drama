@@ -211,9 +211,8 @@ export default function ProjectWorkbench() {
     }
   }
 
-  // ─── Send Message ───
-  const handleSend = async () => {
-    const text = inputText.trim()
+  // ─── Send Message (core logic, supports phase override) ───
+  const sendMessage = useCallback(async (text: string, overridePhase?: SkillPhase) => {
     if (!text || isStreaming) return
 
     const engineConfig = getEngineConfig()
@@ -222,16 +221,17 @@ export default function ProjectWorkbench() {
       return
     }
 
+    const usePhase = overridePhase || currentPhase
+
     const userMsg: ChatMessage = {
       role: 'user',
       content: text,
       timestamp: new Date().toISOString(),
-      skill: currentPhase,
+      skill: usePhase,
     }
 
     const updatedMessages = [...messages, userMsg]
     setMessages(updatedMessages)
-    setInputText('')
     setIsStreaming(true)
     setStreamingContent('')
 
@@ -244,7 +244,7 @@ export default function ProjectWorkbench() {
             role: m.role,
             content: m.content,
           })),
-          phase: currentPhase,
+          phase: usePhase,
           engineConfig,
         }),
       })
@@ -295,7 +295,7 @@ export default function ProjectWorkbench() {
         role: 'assistant',
         content: accumulated,
         timestamp: new Date().toISOString(),
-        skill: currentPhase,
+        skill: usePhase,
       }
 
       const finalMessages = [...updatedMessages, assistantMsg]
@@ -315,6 +315,14 @@ export default function ProjectWorkbench() {
     } finally {
       setIsStreaming(false)
     }
+  }, [isStreaming, messages, currentPhase, saveMessages])
+
+  // ─── Send from Input Box ───
+  const handleSend = async () => {
+    const text = inputText.trim()
+    if (!text || isStreaming) return
+    setInputText('')
+    await sendMessage(text)
   }
 
   // ─── Time formatting ───
@@ -448,8 +456,14 @@ export default function ProjectWorkbench() {
               工具
             </p>
 
-            <ToolButton emoji="🔥" label="热点雷达" onClick={() => setCenterTab('chat')} />
-            <ToolButton emoji="📊" label="爆款分析" onClick={() => setCenterTab('chat')} />
+            <ToolButton emoji="🔥" label="热点雷达" onClick={() => {
+              setCenterTab('chat')
+              if (!isStreaming) sendMessage('🔥 启动热点雷达：请扫描当前全网热点趋势，分析赛道温度，给出AI短剧选题建议。', 'topic')
+            }} />
+            <ToolButton emoji="📊" label="爆款分析" onClick={() => {
+              setCenterTab('chat')
+              if (!isStreaming) sendMessage('📊 启动爆款分析：请解构当前短剧爆款作品，分析赛道趋势，评估AI漫剧借鉴价值。', 'hit-analysis')
+            }} />
             <ToolButton emoji="🔍" label="审核扫描" onClick={() => {
               setRightTab('audit')
               setRightCollapsed(false)

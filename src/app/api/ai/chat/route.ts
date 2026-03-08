@@ -98,6 +98,8 @@ export async function POST(req: NextRequest) {
       model: engineConfig.config.model,
       messages: openaiMessages,
       stream: true,
+      max_tokens: 4096,
+      temperature: 0.7,
     })
     console.log('[chat] stream created successfully')
   } catch (e) {
@@ -112,7 +114,12 @@ export async function POST(req: NextRequest) {
       let chunkCount = 0
       try {
         for await (const chunk of stream) {
-          const text = chunk.choices?.[0]?.delta?.content || ''
+          // 兼容不同 API 返回格式
+          const delta = chunk.choices?.[0]?.delta
+          const text = delta?.content || ''
+          if (chunkCount === 0) {
+            console.log('[chat] first chunk structure:', JSON.stringify(chunk).slice(0, 300))
+          }
           if (text) {
             chunkCount++
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`))
