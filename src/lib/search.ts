@@ -45,7 +45,7 @@ async function fetchRSS(path: string): Promise<string | null> {
     try {
       const res = await fetch(`${instance}${path}`, {
         headers: { Accept: 'application/xml' },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(3000),
       })
       if (res.ok) return await res.text()
     } catch {
@@ -79,12 +79,23 @@ export async function fetchHotList(platform: keyof typeof HOTLIST_PATHS): Promis
 
 export async function fetchAllHotLists(): Promise<Record<string, HotItem[]>> {
   const platforms = Object.keys(HOTLIST_PATHS) as Array<keyof typeof HOTLIST_PATHS>
-  const results = await Promise.allSettled(platforms.map((p) => fetchHotList(p)))
-  const out: Record<string, HotItem[]> = {}
-  platforms.forEach((p, i) => {
-    out[p] = results[i].status === 'fulfilled' ? results[i].value : []
-  })
-  return out
+  // 总超时 5 秒，避免阻塞 API 响应
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('hotlist timeout')), 5000)
+  )
+  try {
+    const results = await Promise.race([
+      Promise.allSettled(platforms.map((p) => fetchHotList(p))),
+      timeout,
+    ]) as PromiseSettledResult<HotItem[]>[]
+    const out: Record<string, HotItem[]> = {}
+    platforms.forEach((p, i) => {
+      out[p] = results[i].status === 'fulfilled' ? results[i].value : []
+    })
+    return out
+  } catch {
+    return {}
+  }
 }
 
 // ==================== 工具函数 ====================
