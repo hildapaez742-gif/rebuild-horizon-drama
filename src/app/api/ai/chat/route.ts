@@ -112,21 +112,26 @@ export async function POST(req: NextRequest) {
   const readable = new ReadableStream({
     async start(controller) {
       let chunkCount = 0
+      let totalChunksSeen = 0
+      let lastRawChunk: unknown = null
       try {
         for await (const chunk of stream) {
+          totalChunksSeen++
+          lastRawChunk = chunk
           // 兼容不同 API 返回格式
           const delta = chunk.choices?.[0]?.delta
           const text = delta?.content || ''
-          if (chunkCount === 0) {
-            console.log('[chat] first chunk structure:', JSON.stringify(chunk).slice(0, 300))
+          if (totalChunksSeen <= 2) {
+            console.log(`[chat] chunk #${totalChunksSeen} raw:`, JSON.stringify(chunk).slice(0, 500))
           }
           if (text) {
             chunkCount++
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`))
           }
         }
-        console.log('[chat] stream done, chunks:', chunkCount)
+        console.log('[chat] stream done, totalChunks:', totalChunksSeen, 'textChunks:', chunkCount)
         if (chunkCount === 0) {
+          console.error('【API 真实报错】stream 遍历完毕但无文本内容。totalChunksSeen:', totalChunksSeen, '最后 chunk:', JSON.stringify(lastRawChunk).slice(0, 500))
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: 'AI 返回了空内容，请检查模型配置或重试' })}\n\n`))
         }
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))

@@ -277,6 +277,7 @@ export default function ProjectWorkbench() {
           try {
             const parsed = JSON.parse(payload)
             if (parsed.error) {
+              console.error('【API 真实报错】SSE error payload:', JSON.stringify(parsed))
               accumulated += `\n\n[Error: ${parsed.error}]`
               setStreamingContent(accumulated)
               continue
