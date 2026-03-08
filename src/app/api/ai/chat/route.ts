@@ -28,6 +28,33 @@ function sseError(message: string): Response {
   })
 }
 
+/**
+ * 从 stream chunk 中提取文本，兼容多种 API 返回格式：
+ * - OpenAI 标准: choices[0].delta.content
+ * - 部分代理:    choices[0].message.content
+ * - Anthropic 原生透传: delta.text / content_block.text
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractTextFromChunk(chunk: any): string {
+  // Path 1: OpenAI standard streaming format
+  const deltaContent = chunk?.choices?.[0]?.delta?.content
+  if (typeof deltaContent === 'string' && deltaContent) return deltaContent
+
+  // Path 2: Some proxies return message instead of delta
+  const msgContent = chunk?.choices?.[0]?.message?.content
+  if (typeof msgContent === 'string' && msgContent) return msgContent
+
+  // Path 3: Anthropic native format (content_block_delta)
+  const anthropicDelta = chunk?.delta?.text
+  if (typeof anthropicDelta === 'string' && anthropicDelta) return anthropicDelta
+
+  // Path 4: Anthropic content_block
+  const blockText = chunk?.content_block?.text
+  if (typeof blockText === 'string' && blockText) return blockText
+
+  return ''
+}
+
 export async function POST(req: NextRequest) {
   // 1. 解析请求
   let body: Record<string, unknown>
@@ -71,15 +98,14 @@ export async function POST(req: NextRequest) {
   const systemPrompt = buildSystemPrompt(phase, extraContext || undefined)
 
   // 3. 创建 OpenAI 客户端
+  //    注意：不注入 anthropic-version header —— 该头部仅适用于 Anthropic
+  //    原生 Messages API，注入到 OAI 兼容 /chat/completions 会干扰响应格式
   const baseURL = engineConfig.config.baseUrl || DEFAULT_BASE_URLS[engineConfig.activeEngine]
   console.log('[chat] using baseURL:', baseURL)
 
   const client = new OpenAI({
     apiKey: engineConfig.config.apiKey,
     baseURL,
-    defaultHeaders: engineConfig.activeEngine === 'claude'
-      ? { 'anthropic-version': '2023-06-01' }
-      : undefined,
   })
 
   const openaiMessages: OpenAI.ChatCompletionMessageParam[] = [
@@ -113,17 +139,17 @@ export async function POST(req: NextRequest) {
     async start(controller) {
       let chunkCount = 0
       let totalChunksSeen = 0
-      let lastRawChunk: unknown = null
+      let firstChunkRaw = ''
       try {
         for await (const chunk of stream) {
           totalChunksSeen++
-          lastRawChunk = chunk
-          // 兼容不同 API 返回格式
-          const delta = chunk.choices?.[0]?.delta
-          const text = delta?.content || ''
+          // 记录前两个 chunk 结构用于诊断
           if (totalChunksSeen <= 2) {
-            console.log(`[chat] chunk #${totalChunksSeen} raw:`, JSON.stringify(chunk).slice(0, 500))
+            const raw = JSON.stringify(chunk).slice(0, 400)
+            console.log(`[chat] chunk #${totalChunksSeen}:`, raw)
+            if (totalChunksSeen === 1) firstChunkRaw = raw
           }
+          const text = extractTextFromChunk(chunk)
           if (text) {
             chunkCount++
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`))
@@ -131,8 +157,11 @@ export async function POST(req: NextRequest) {
         }
         console.log('[chat] stream done, totalChunks:', totalChunksSeen, 'textChunks:', chunkCount)
         if (chunkCount === 0) {
-          console.error('【API 真实报错】stream 遍历完毕但无文本内容。totalChunksSeen:', totalChunksSeen, '最后 chunk:', JSON.stringify(lastRawChunk).slice(0, 500))
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: 'AI 返回了空内容，请检查模型配置或重试' })}\n\n`))
+          // 将首个 chunk 结构包含在错误消息中，方便用户诊断 API 实际返回格式
+          const hint = totalChunksSeen === 0
+            ? '（API 返回了 0 个 chunk，可能端点不正确）'
+            : `（收到 ${totalChunksSeen} 个 chunk 但均无文本，首个 chunk: ${firstChunkRaw.slice(0, 150)}）`
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: `AI 返回了空内容 ${hint}` })}\n\n`))
         }
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         controller.close()

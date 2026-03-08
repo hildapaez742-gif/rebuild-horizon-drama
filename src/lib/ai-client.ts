@@ -7,10 +7,11 @@ const DEFAULT_BASE_URLS = {
 } as const
 
 function getClient(config: AppConfig['engines'][keyof AppConfig['engines']], engine: 'claude' | 'qwen') {
+  // 不注入 anthropic-version header：该头部仅适用于 Anthropic 原生 Messages API，
+  // 注入到 OAI 兼容 /chat/completions 端点会干扰响应格式
   return new OpenAI({
     apiKey: config.apiKey,
     baseURL: config.baseUrl || DEFAULT_BASE_URLS[engine],
-    defaultHeaders: engine === 'claude' ? { 'anthropic-version': '2023-06-01' } : undefined,
   })
 }
 
