@@ -214,23 +214,27 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // ─── 5b. 标准流式 SSE 响应 ───
-  console.log('[chat] processing as SSE stream')
+  // ─── 5b. 读取 body 并智能识别格式 ───
+  // 不信任 Content-Type：中转服务器可能返回 JSON body 却带着 text/event-stream 头
+  // 策略：先尝试 SSE 解析，若 0 个有效 chunk 则对原始 body 做 JSON 兜底
+  console.log('[chat] reading response body (content-type:', contentType, ')')
   const encoder = new TextEncoder()
   const readable = new ReadableStream({
     async start(controller) {
       const reader = response.body!.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+      let rawBody = '' // ★ 累积完整原始 body 用于 JSON 兜底
       let chunkCount = 0
-      let firstChunkRaw = ''
 
       try {
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
 
-          buffer += decoder.decode(value, { stream: true })
+          const decoded = decoder.decode(value, { stream: true })
+          rawBody += decoded // ★ 始终累积原始文本
+          buffer += decoded
           const lines = buffer.split('\n')
           buffer = lines.pop()!
 
@@ -242,10 +246,6 @@ export async function POST(req: NextRequest) {
 
             try {
               const chunk = JSON.parse(payload)
-              if (chunkCount === 0) {
-                firstChunkRaw = JSON.stringify(chunk).slice(0, 200)
-                console.log('[chat] first SSE chunk:', firstChunkRaw)
-              }
               const text = extractTextFromChunk(chunk)
               if (text) {
                 chunkCount++
@@ -254,14 +254,47 @@ export async function POST(req: NextRequest) {
             } catch { /* ignore SSE parse errors */ }
           }
         }
+        // rawBody 已在循环内累积了所有 decoded 内容，无需再加 buffer
+        console.log('[chat] stream done, SSE textChunks:', chunkCount, 'rawBody length:', rawBody.length)
 
-        console.log('[chat] stream done, textChunks:', chunkCount)
-        if (chunkCount === 0) {
-          const hint = firstChunkRaw
-            ? `（首个 chunk: ${firstChunkRaw}）`
-            : '（未收到有效 SSE 事件）'
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: `AI 返回了空内容 ${hint}` })}\n\n`))
+        // ★★★ 核心兜底：SSE 解析 0 个 chunk → 尝试把整个 body 当 JSON 解析 ★★★
+        if (chunkCount === 0 && rawBody.trim()) {
+          console.log('[chat] 0 SSE chunks, trying JSON fallback. Body preview:', rawBody.slice(0, 300))
+          try {
+            const data = JSON.parse(rawBody.trim())
+
+            // 检查 API 错误
+            if (data?.error) {
+              const errMsg = typeof data.error === 'string'
+                ? data.error
+                : data.error?.message || JSON.stringify(data.error).slice(0, 200)
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: `AI 错误: ${errMsg}` })}\n\n`))
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              controller.close()
+              return
+            }
+
+            // 提取文本
+            const text = extractTextFromNonStream(data)
+            if (text) {
+              console.log('[chat] ✅ JSON fallback succeeded! Text length:', text.length)
+              // 分段发送给前端，模拟渐进渲染
+              for (let i = 0; i < text.length; i += 200) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: text.slice(i, i + 200) })}\n\n`))
+              }
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              controller.close()
+              return
+            }
+
+            // JSON 解析成功但提取不到文本
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: `AI 返回了无法识别的 JSON 格式（keys: ${Object.keys(data).join(', ')}）` })}\n\n`))
+          } catch {
+            // 既不是 SSE 也不是 JSON
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: `AI 返回了无法解析的响应（body: ${rawBody.slice(0, 120)}）` })}\n\n`))
+          }
         }
+
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         controller.close()
       } catch (e) {
